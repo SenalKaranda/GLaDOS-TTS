@@ -1,19 +1,25 @@
+import os
 import torch
 import numpy as np
 from utils.tools import prepare_text
 from scipy.io.wavfile import write
 import time
+import re
 import tempfile
 import subprocess
 from pydub import AudioSegment
 from pydub.playback import play
-from nltk import download
-from nltk.tokenize import sent_tokenize
 from sys import modules as mod
 try:
     import winsound
 except ImportError:
     from subprocess import call
+import dp.preprocessing.text
+
+import nltk.tokenize.punkt
+print(nltk.tokenize.punkt.PunktTokenizer.__module__)
+
+
 print("Initializing TTS Engine...")
 
 kwargs = {
@@ -36,6 +42,12 @@ class tts_runner:
             self.device = 'vulkan'
         else:
             self.device = 'cpu'
+
+        torch.serialization.add_safe_globals([
+            dp.preprocessing.text.Preprocessor,
+            dp.preprocessing.text.LanguageTokenizer,
+            dp.preprocessing.text.SequenceTokenizer
+        ])
 
         # Load models
         self.glados = torch.jit.load('models/glados-new.pt')
@@ -72,28 +84,38 @@ class tts_runner:
             sound = AudioSegment.from_wav(output_file)
             output_file.close()
             return sound
+    
+    @staticmethod
+    def sanitize_filename(text: str) -> str:
+        sanitized = re.sub(r'[^a-zA-Z0-9\s-]', '', text)
+        sanitized = re.sub(r'\s+', '-', sanitized.strip())
+        return sanitized[:100]
 
-    def speak_one_line(self, audio, name: str):
-        audio.export(name, format = "wav")
+    def speak_one_line(self, audio, raw_text: str):
+        os.makedirs("outputs", exist_ok=True)
+        filename = "./outputs-split/" + tts_runner.sanitize_filename(raw_text) + ".wav"
+        audio.export(filename, format="wav")
         if 'winsound' in mod:
-            winsound.PlaySound(name, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            winsound.PlaySound(filename, winsound.SND_FILENAME | winsound.SND_ASYNC)
         else:
             try:
-                subprocess.Popen(["play", name], **kwargs)
+                subprocess.Popen(["play", filename], **kwargs)
             except FileNotFoundError:
                 try:
-                    subprocess.Popen(["aplay", name], **kwargs)
+                    subprocess.Popen(["aplay", filename], **kwargs)
                 except FileNotFoundError:
-                    subprocess.Popen(["pw-play", name], **kwargs)
+                    subprocess.Popen(["pw-play", filename], **kwargs)
 
 
     def speak(self, text, alpha: float=1.0, save: bool=False, delay: float=0.1):
-        download('punkt',quiet=self.log)
-        sentences = sent_tokenize(text)
+        from nltk.tokenize.punkt import PunktSentenceTokenizer, PunktParameters
+        punkt_param = PunktParameters()
+        tokenizer = PunktSentenceTokenizer(punkt_param)
+        sentences = tokenizer.tokenize(text)
         audio = self.run_tts(sentences[0])
         pause = AudioSegment.silent(duration=delay)
         old_line = AudioSegment.silent(duration=1.0) + audio
-        self.speak_one_line(old_line, "old_line.wav")
+        self.speak_one_line(old_line, sentences[0])
         old_time = time.time()
         old_dur = old_line.duration_seconds
         new_dur = old_dur
@@ -113,15 +135,18 @@ class tts_runner:
                 else:
                     time.sleep(time_left + delay)
                 if idx % 2 == 1:
-                    self.speak_one_line(new_line, "new_line.wav")
+                    self.speak_one_line(new_line, sentences[idx])
                 else:
-                    self.speak_one_line(old_line, "old_line.wav")
+                    self.speak_one_line(old_line, sentences[idx])
                 old_time = time.time()
                 old_dur = new_dur
         else:
             time.sleep(old_dur + 0.1)
+        
+        os.makedirs("outputs", exist_ok=True)
+        final_filename = "./outputs-full/" + self.sanitize_filename(text) + ".wav"
+        audio.export(final_filename, format="wav")
 
-        audio.export("output.wav", format = "wav")
         time_left = old_dur - time.time() + old_time
         if time_left >= 0:
             time.sleep(time_left + delay)
